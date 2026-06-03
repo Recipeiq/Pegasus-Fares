@@ -72,7 +72,7 @@ AIRLINE_NAMES = {
 
 PRICE_IS_TOTAL_FOR_ALL_PAX = True   # SerpApi — verify on run 1
 TPAY_PRICE_IS_PER_PERSON = True     # Travelpayouts — verify on run 1
-ALWAYS_REPORT = False
+ALWAYS_REPORT = True
 CONFIRM_BUFFER = 1.15
 MOMENTUM_WINDOW = 14
 CURRENCY = "USD"
