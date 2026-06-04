@@ -154,10 +154,15 @@ def read_history(route_label=None):
     return [r for r in rows if r["route"]==route_label] if route_label else rows
 
 def history_momentum(route_label):
-    # use RT rows only for momentum
-    rows   = [r for r in read_history(route_label)
-              if r.get("ticket_type","RT") == "RT"][-MOMENTUM_WINDOW:]
-    prices = [float(r["per_person"]) for r in rows if r.get("per_person")]
+    # use RT rows only for momentum; skip any corrupted/shifted rows
+    rows = [r for r in read_history(route_label)
+            if r.get("ticket_type","RT") == "RT"][-MOMENTUM_WINDOW:]
+    prices = []
+    for r in rows:
+        try:
+            prices.append(float(r["per_person"]))
+        except (ValueError, TypeError):
+            pass
     if len(prices) < 3: return None, 0.0
     first, last = prices[0], prices[-1]
     pct = (last-first)/first*100 if first else 0.0
