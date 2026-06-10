@@ -18,7 +18,11 @@ v5  2026-06-03  Dead-man's switch. Two fuses: no-data (~24h) and
                 no-window (~48h). DEADMAN_CHAT_ID operator routing.
 v6  2026-06-03  Multi-airport origins (BUF + ROC). Per-origin comparison
                 block in alert. Drive-savings line.
-v7  2026-06-03  Split one-ways. Prices each direction separately, compares
+v7.3 2026-06-09  Drop nudge — lightweight 📉 update when price moves your way
+                while still above target. Separate from BOOK/WATCH/WAIT signals.
+                Fixes: last_per_person now actually persisted; recent_low tracked.
+v7.2 2026-06-04  Two-tier price targets (WATCH $330, BOOK $280).
+                Outbound window widened 06:00-17:00 to catch afternoon nonstops.
                 combo vs round-trip. Self-connect risk warning required
                 in every split alert. ticket_type column in history.
 
@@ -68,13 +72,19 @@ ROUTES = [
         "return_date":   "2026-08-22",
         "adults": 5,
         "nonstop_only": True,
-        "target_per_person": 250,
+        "target_per_person": 280,   # BOOK signal — act now
+        "watch_per_person":  330,   # WATCH signal — market moving, start paying attention
         "alert_on_drop_pct": 8,
+        # Drop-nudge: lightweight 📉 update when price moves your way while
+        # still above target. Fires if drop vs last scan >= EITHER threshold.
+        "nudge_drop_pct": 5,        # >= 5% drop from recent high
+        "nudge_drop_abs": 40,       # OR >= $40/pp drop from recent high
+        "nudge_cooldown_h": 24,     # min hours between nudges (unless fresh new low)
         "include_airlines": [],
         "exclude_airlines": ["F9"],
         "time_window": {
             "outbound_after":  "06:00",
-            "outbound_before": "12:00",
+            "outbound_before": "17:00",  # widened from 12:00 — catches afternoon nonstops
             "return_after":    "13:00",
             "return_before":   "22:00",
         },
@@ -503,12 +513,18 @@ def book_signal(route, per_person, level, typ_range):
     if trend: reasons.append(f"history: {trend} ({pct:+.0f}% over last {MOMENTUM_WINDOW} scans)")
     cheap    = (level=="low")  or (pos is not None and pos<=0.35)
     pricey   = (level=="high") or (pos is not None and pos>=0.70)
-    at_target = per_person <= route["target_per_person"]
-    if   at_target and cheap:                        verdict="BOOK";  reasons.append("at/below target AND low in band")
+    at_book  = per_person <= route["target_per_person"]           # hard BOOK target ($280)
+    at_watch = per_person <= route.get("watch_per_person",        # WATCH target ($330)
+                                       route["target_per_person"])
+    at_target = at_book   # kept for backward compat in verdict logic
+    if at_watch and not at_book:
+        reasons.append(f"below WATCH target (${route.get('watch_per_person',route['target_per_person']):,.0f}) — approaching BOOK at ${route['target_per_person']:,.0f}")
+    if   at_target and cheap:                        verdict="BOOK";  reasons.append("at/below BOOK target AND low in band")
     elif urgent and not pricey:                      verdict="BOOK";  reasons.append("near the wall and price is reasonable")
     elif pricey:                                     verdict="WAIT";  reasons.append("high in band — downside likely")
     elif trend=="trending DOWN" and not at_target:   verdict="WATCH"; reasons.append("falling — hold for a better entry")
-    elif at_target:                                  verdict="WATCH"; reasons.append("at target but not yet low in band")
+    elif at_target:                                  verdict="WATCH"; reasons.append("at BOOK target but not yet low in band")
+    elif at_watch:                                   verdict="WATCH"; reasons.append("in WATCH zone — monitor closely")
     else:                                            verdict="WATCH"; reasons.append("mid-band — keep scanning")
     return verdict, pos, reasons
 
@@ -630,6 +646,30 @@ def split_block(split_result, rt_per_person, route):
     return "\n".join(lines)
 
 
+# ── DROP NUDGE ────────────────────────────────────────────────────────
+def drop_nudge_msg(route, per_person, ref, recent_low, pos):
+    """Lightweight 'price moving your way' update, distinct from fare signals.
+    `ref` is the recent reference high we're measuring the cumulative drop from."""
+    pax        = route["adults"]
+    drop_abs   = ref - per_person
+    drop_pct   = drop_abs / ref * 100 if ref else 0
+    watch      = route.get("watch_per_person", route["target_per_person"])
+    book       = route["target_per_person"]
+    above_watch = per_person - watch
+    msg = (f"📉 *PRICE MOVING YOUR WAY* — {route['label']}\n\n"
+           f"Now *${per_person:,.0f}/pp* (total ${per_person*pax:,.0f} for {pax})\n"
+           f"Down *${drop_abs:,.0f}/pp* ({drop_pct:.0f}%) from recent high of ${ref:,.0f}")
+    if isinstance(recent_low,(int,float)) and per_person <= recent_low:
+        msg += "  ·  *new low* 👀"
+    msg += "\n"
+    if above_watch > 0:
+        msg += f"Still ${above_watch:,.0f}/pp above WATCH (${watch:,.0f}); BOOK at ${book:,.0f}.\n"
+    if pos is not None:
+        msg += f"Band position: {pos*100:.0f}% up typical range.\n"
+    msg += "\n_Heads-up only — not a buy signal yet._"
+    return msg
+
+
 # ── CORE SCAN ─────────────────────────────────────────────────────────
 def scan_route(route, state, force_confirm=False):
     key  = route["label"]
@@ -639,7 +679,7 @@ def scan_route(route, state, force_confirm=False):
     best, all_results, status = scan_all_origins(route, state)
 
     if status != ST_OK or best is None:
-        return status, None
+        return status, None, None
 
     per_person = best["per_person"]
     level      = best["level"]
@@ -654,9 +694,46 @@ def scan_route(route, state, force_confirm=False):
     log_history(route, origin_id, "RT", per_person, level,
                 typ_range, verdict, source, airline)
 
-    drop      = ((last-per_person)/last*100) if last else 0
-    rt_triggered = (per_person<=route["target_per_person"] or level=="low"
+    drop         = ((last-per_person)/last*100) if last else 0
+    watch_target = route.get("watch_per_person", route["target_per_person"])
+    rt_triggered = (per_person<=watch_target or level=="low"
                     or drop>=route["alert_on_drop_pct"] or verdict=="BOOK")
+
+    # --- drop nudge: cumulative move down from a rolling reference high ---
+    # Measures the drop from the recent PEAK, not just the last scan, so a
+    # multi-step slide (618 -> 599 -> 573) registers as one meaningful move.
+    rs         = state.get(key, {})
+    recent_low = rs.get("recent_low")
+    ref        = rs.get("nudge_ref")            # price we measure the drop from
+    last_nudge_ts = rs.get("nudge_ts", 0)
+    nudge_msg  = None
+
+    if ref is None or per_person > ref:
+        # first run, or price climbed — reference follows the peak up
+        ref = per_person
+
+    ref_drop_abs = ref - per_person
+    ref_drop_pct = (ref_drop_abs / ref * 100) if ref else 0
+    hit_pct = ref_drop_pct >= route.get("nudge_drop_pct", 5)
+    hit_abs = ref_drop_abs >= route.get("nudge_drop_abs", 40)
+    cooldown_ok = (time.time() - last_nudge_ts) > route.get("nudge_cooldown_h", 24) * 3600
+
+    # nudge only if: meaningful cumulative drop, fare signal NOT already firing,
+    # and either cooldown elapsed OR this is a fresh deeper low than when we last nudged
+    fresh_low = (recent_low is None) or (per_person < recent_low)
+    if (hit_pct or hit_abs) and not rt_triggered and (cooldown_ok or fresh_low):
+        nudge_msg = drop_nudge_msg(route, per_person, ref, recent_low, pos)
+        log.info("[%s] drop nudge: $%.0f (-$%.0f, -%.0f%% from ref $%.0f)",
+                 key, per_person, ref_drop_abs, ref_drop_pct, ref)
+        rs["nudge_ts"] = time.time()
+        ref = per_person   # reset reference so next nudge measures a fresh leg down
+
+    # persist tracking (state[key] is a live ref saved in run_scan)
+    state[key]["last_per_person"] = per_person
+    state[key]["nudge_ref"]       = ref
+    state[key]["nudge_ts"]        = rs.get("nudge_ts", last_nudge_ts)
+    if recent_low is None or per_person < recent_low:
+        state[key]["recent_low"] = per_person
 
     # Split one-way scan — only when confirm is warranted or forced
     split_result = None
@@ -676,7 +753,7 @@ def scan_route(route, state, force_confirm=False):
     triggered = rt_triggered or split_triggered
     if not (triggered or force_confirm or ALWAYS_REPORT):
         log.info("[%s] $%.0f/pp RT (%s, %s) — no trigger", key, per_person, level, verdict)
-        return ST_OK, None
+        return ST_OK, None, nudge_msg
 
     pax       = route["adults"]
     range_str = (f"${typ_range[0]:,.0f}-${typ_range[1]:,.0f}"
@@ -688,7 +765,8 @@ def scan_route(route, state, force_confirm=False):
 
     msg = (f"*FARE SIGNAL: {verdict}*\n*{route['label']}*\n\n"
            f"Best RT: *${per_person:,.0f}/person*  "
-           f"(total ${per_person*pax:,.0f} for {pax})  via *{best['origin_label']}*\n")
+           f"(total ${per_person*pax:,.0f} for {pax})  via *{best['origin_label']}*\n"
+           f"Targets: WATCH ≤${route.get('watch_per_person',route['target_per_person']):,.0f}  ·  BOOK ≤${route['target_per_person']:,.0f}\n")
     if comp:
         msg += f"\n*Origin comparison:*\n{comp}\n"
     msg += (f"\nCarrier: {air_str}   Filter: {airline_rule_str(route)}\n"
@@ -698,7 +776,7 @@ def scan_route(route, state, force_confirm=False):
             f"Reasoning:\n{why}\n\n"
             f"[Open in Google Flights]({url})")
     msg += split_block(split_result, per_person, route)
-    return ST_OK, msg
+    return ST_OK, msg, nudge_msg
 
 
 # ── RUN SCAN ──────────────────────────────────────────────────────────
@@ -709,10 +787,10 @@ def run_scan(force_confirm=False):
         key = route["label"]
         state.setdefault(key, {})
         try:
-            status, msg = scan_route(route, state, force_confirm)
+            status, msg, nudge = scan_route(route, state, force_confirm)
         except Exception as e:
             log.exception("[%s] unexpected error: %s", key, e)
-            status, msg = ST_NO_DATA, None
+            status, msg, nudge = ST_NO_DATA, None, None
         if status == ST_OK:
             check_deadman_clear(route, state)
             state[key]["consec_no_data"]   = 0
@@ -721,6 +799,9 @@ def run_scan(force_confirm=False):
             if msg:
                 send_telegram(msg); messages.append(msg)
                 log.info("[%s] fare alert sent", key)
+            elif nudge:
+                send_telegram(nudge); messages.append(nudge)
+                log.info("[%s] drop nudge sent", key)
         elif status == ST_NO_DATA:
             state[key]["consec_no_data"]   = state[key].get("consec_no_data",0)+1
             state[key]["consec_no_window"] = 0

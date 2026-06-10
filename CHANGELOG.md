@@ -5,6 +5,18 @@ Repo: `Recipeiq/Pegasus-Fares`
 
 ---
 
+## v7.1 — 2026-06-04
+**Bug fix: history_momentum crash on schema-shifted rows**
+- `history_momentum` crashed with `ValueError: could not convert string to float: 'BUF'`
+  on all scans after v6 deploy. Root cause: v6 added an `origin` column to history.csv
+  but early rows written before v6 had columns shifted — origin value ("BUF") landed
+  in the `per_person` slot, causing `float()` to throw on every momentum read.
+- Fix: wrapped `float(r["per_person"])` in try/except — corrupted/shifted rows are
+  silently skipped rather than crashing the entire scan.
+- Data fix: `FARE_HISTORY_PATH=/data/history_v2.csv` set in Railway to start clean.
+- Dead-man's switch correctly fired after 5 consecutive failed scans (~21h gap),
+  confirming v5 fuse logic works end-to-end. All-clear sent on recovery.
+
 ## v7 — 2026-06-03
 **Split one-ways**
 - Prices outbound and return as separate one-way searches (SerpApi type=2)
