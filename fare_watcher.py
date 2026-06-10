@@ -18,6 +18,9 @@ v5  2026-06-03  Dead-man's switch. Two fuses: no-data (~24h) and
                 no-window (~48h). DEADMAN_CHAT_ID operator routing.
 v6  2026-06-03  Multi-airport origins (BUF + ROC). Per-origin comparison
                 block in alert. Drive-savings line.
+v7.4 2026-06-10  Seasonal band — one broad daily SerpApi query captures
+                Google's typical_price_range (the route's historical norm), shown
+                in alerts and logged for the dashboard reference zone.
 v7.3 2026-06-09  Drop nudge — lightweight 📉 update when price moves your way
                 while still above target. Separate from BOOK/WATCH/WAIT signals.
                 Fixes: last_per_person now actually persisted; recent_low tracked.
@@ -107,6 +110,10 @@ DEADMAN_THRESHOLD        = 5
 DEADMAN_WINDOW_THRESHOLD = 8
 DEADMAN_REPEAT_EVERY     = 4
 
+# web mode: internal scheduler fires scans at these UTC hours
+# (matches the old cron 0 6,11,16,21,1 -> 2a/7a/12p/5p/9p ET)
+SCAN_HOURS_UTC = [1, 6, 11, 16, 21]
+
 STATE_PATH   = os.getenv("FARE_STATE_PATH",   "fare_state.json")
 HISTORY_PATH = os.getenv("FARE_HISTORY_PATH", "history.csv")
 
@@ -137,22 +144,28 @@ def save_state(state):
     except OSError as e: log.warning("Could not persist state: %s", e)
 
 HISTORY_COLS = ["ts","date","route","origin","ticket_type","per_person",
-                "level","band_low","band_high","verdict","source","airline"]
+                "level","band_low","band_high","verdict","source","airline",
+                "seasonal_low","seasonal_high","seasonal_level"]
 
 def log_history(route, origin_id, ticket_type, per_person, level,
-                typ_range, verdict, source, airline):
+                typ_range, verdict, source, airline, seasonal=None):
     low  = typ_range[0] if isinstance(typ_range,list) and len(typ_range)==2 else ""
     high = typ_range[1] if isinstance(typ_range,list) and len(typ_range)==2 else ""
+    s    = seasonal or {}
     row  = {"ts": dt.datetime.now().isoformat(timespec="seconds"),
             "date": dt.date.today().isoformat(), "route": route["label"],
             "origin": origin_id, "ticket_type": ticket_type,
             "per_person": round(per_person,2), "level": level,
             "band_low": low, "band_high": high, "verdict": verdict,
-            "source": source, "airline": airline or ""}
+            "source": source, "airline": airline or "",
+            "seasonal_low":  s.get("low",  ""),
+            "seasonal_high": s.get("high", ""),
+            "seasonal_level": s.get("level", "")}
     try:
         new = not os.path.exists(HISTORY_PATH)
         with open(HISTORY_PATH,"a",newline="") as f:
-            w = csv.DictWriter(f, fieldnames=HISTORY_COLS)
+            # extrasaction='ignore' = never crash if schema drifts again (v7.1 lesson)
+            w = csv.DictWriter(f, fieldnames=HISTORY_COLS, extrasaction="ignore")
             if new: w.writeheader()
             w.writerow(row)
     except OSError as e: log.warning("Could not write history: %s", e)
@@ -385,6 +398,57 @@ def serpapi_oneway_origin(route, origin_id, direction):
     url   = oneway_flights_url(dep, arr, date)
     return {"per_person": total/pax, "total": total,
             "itin": best_itin, "airline": air, "url": url}
+
+
+# ── SEASONAL BAND (Google price_insights, broad query) ────────────────
+def serpapi_seasonal_band(route):
+    """
+    One BROAD round-trip query (1 adult, no nonstop/airline/time filters) to
+    coax Google into returning price_insights — its own historical 'typical'
+    range for this route+dates. Our filtered scans return (unknown) because the
+    query is too narrow; this widens it just to capture the seasonal yardstick.
+    Per-person (adults=1), directly comparable to our per_person figures.
+    Returns {low, high, level, lowest} or None.
+    """
+    origin = get_origins(route)[0]["id"]
+    params = {"engine": "google_flights",
+              "departure_id": origin, "arrival_id": route["arrival_id"],
+              "outbound_date": route["outbound_date"], "return_date": route["return_date"],
+              "type": "1", "adults": "1",
+              "currency": CURRENCY, "hl": "en", "api_key": os.environ["SERPAPI_KEY"]}
+    try:
+        r = requests.get("https://serpapi.com/search.json", params=params, timeout=45)
+        r.raise_for_status()
+        ins = r.json().get("price_insights", {}) or {}
+    except (requests.RequestException, ValueError) as e:
+        log.warning("seasonal band fetch failed: %s", e)
+        return None
+    tr = ins.get("typical_price_range")
+    if not (isinstance(tr, list) and len(tr) == 2):
+        return None
+    return {"low": tr[0], "high": tr[1],
+            "level": ins.get("price_level", "unknown"),
+            "lowest": ins.get("lowest_price")}
+
+
+def get_seasonal(route, state):
+    """Return today's cached seasonal band, fetching once per UTC day."""
+    key   = route["label"]
+    rs    = state.setdefault(key, {})
+    today = dt.date.today().isoformat()
+    cached = rs.get("seasonal")
+    if cached and cached.get("date") == today:
+        return cached
+    if not os.getenv("SERPAPI_KEY"):
+        return cached  # keep last known if no key
+    band = serpapi_seasonal_band(route)
+    if band:
+        band["date"] = today
+        rs["seasonal"] = band
+        log.info("[%s] seasonal band: $%.0f-$%.0f (%s)",
+                 key, band["low"], band["high"], band["level"])
+        return band
+    return cached  # fetch failed — keep last known band rather than blank
 
 
 def describe_itinerary(itin):
@@ -691,8 +755,9 @@ def scan_route(route, state, force_confirm=False):
     source     = best["source"]
 
     verdict, pos, reasons = book_signal(route, per_person, level, typ_range)
+    seasonal = get_seasonal(route, state)   # Google's typical range (once/day)
     log_history(route, origin_id, "RT", per_person, level,
-                typ_range, verdict, source, airline)
+                typ_range, verdict, source, airline, seasonal)
 
     drop         = ((last-per_person)/last*100) if last else 0
     watch_target = route.get("watch_per_person", route["target_per_person"])
@@ -771,8 +836,18 @@ def scan_route(route, state, force_confirm=False):
         msg += f"\n*Origin comparison:*\n{comp}\n"
     msg += (f"\nCarrier: {air_str}   Filter: {airline_rule_str(route)}\n"
             f"Times: {time_window_str(route)}\n"
-            f"Google verdict: *{level.upper()}*   typical: {range_str} ({pos_str})\n"
-            f"{describe_itinerary(itin)}\nSource: {source}\n\n"
+            f"Google verdict: *{level.upper()}*   typical: {range_str} ({pos_str})\n")
+    if seasonal and seasonal.get("low") and seasonal.get("high"):
+        slow, shigh = seasonal["low"], seasonal["high"]
+        if per_person < slow:
+            rel = f"*below* Google's typical for this route 👀"
+        elif per_person > shigh:
+            rel = f"above Google's typical — still pricey for this route"
+        else:
+            rel = "within Google's typical range"
+        msg += (f"Seasonal (Google typical for route+dates): "
+                f"${slow:,.0f}-${shigh:,.0f} — you're {rel}\n")
+    msg += (f"{describe_itinerary(itin)}\nSource: {source}\n\n"
             f"Reasoning:\n{why}\n\n"
             f"[Open in Google Flights]({url})")
     msg += split_block(split_result, per_person, route)
@@ -849,10 +924,104 @@ def serve():
             log.warning("serve poll error: %s", e); time.sleep(5)
 
 
+# ── WEB MODE — serve data + run scans on an internal schedule ─────────
+def _history_json():
+    """Build the dashboard payload from logged history (RT rows only)."""
+    route = ROUTES[0]
+    rows  = read_history(route["label"])
+    hist, seasonal = [], None
+    for r in rows:
+        if r.get("ticket_type", "RT") != "RT":
+            continue
+        try:
+            pp = float(r["per_person"])
+        except (ValueError, TypeError):
+            continue
+        item = {"date": r.get("date", ""), "price": round(pp)}
+        sl, sh = r.get("seasonal_low"), r.get("seasonal_high")
+        try:
+            if sl and sh:
+                lo, hi = round(float(sl)), round(float(sh))
+                item["seasonal_low"], item["seasonal_high"] = lo, hi
+                seasonal = {"low": lo, "high": hi, "level": r.get("seasonal_level", "")}
+        except (ValueError, TypeError):
+            pass
+        hist.append(item)
+    return route, hist, seasonal
+
+
+def web():
+    try:
+        from flask import Flask, jsonify
+    except ImportError:
+        log.error("Flask not installed — add 'flask' to requirements.txt"); sys.exit(1)
+    import threading
+
+    app = Flask(__name__)
+
+    @app.after_request
+    def _cors(resp):
+        # public, read-only fare data — safe to allow any origin
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+
+    @app.get("/health")
+    def health():
+        state = load_state()
+        last = max([rs.get("last_success_ts", 0) for rs in state.values()
+                    if isinstance(rs, dict)] or [0])
+        stale = (time.time() - last) > 6 * 3600 if last else True
+        return jsonify({"ok": True, "last_success_ts": last, "stale": stale})
+
+    @app.get("/data")
+    def data():
+        route, hist, seasonal = _history_json()
+        return jsonify({
+            "route":    route["label"],
+            "updated":  dt.datetime.utcnow().isoformat() + "Z",
+            "history":  hist,
+            "seasonal": seasonal,
+            "current":  hist[-1]["price"] if hist else None,
+            "targets":  {"watch": route.get("watch_per_person",
+                                            route["target_per_person"]),
+                         "book": route["target_per_person"]},
+        })
+
+    @app.get("/")
+    def root():
+        return jsonify({"service": "pegasus-fares",
+                        "endpoints": ["/data", "/health"]})
+
+    def scheduler_loop():
+        ran = {}
+        log.info("=== web scheduler started (UTC hours %s) ===", SCAN_HOURS_UTC)
+        while True:
+            try:
+                now   = dt.datetime.utcnow()
+                today = now.date().isoformat()
+                slots = ran.setdefault(today, set())
+                if now.hour in SCAN_HOURS_UTC and now.hour not in slots:
+                    slots.add(now.hour)
+                    log.info("scheduler firing scan (%02d:00 UTC)", now.hour)
+                    run_scan(force_confirm=False)
+                for d in list(ran):       # drop yesterday's slot record
+                    if d != today: del ran[d]
+            except Exception as e:
+                log.exception("scheduler error: %s", e)
+            time.sleep(45)
+
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 8080))
+    log.info("=== web mode: serving on 0.0.0.0:%d ===", port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
+
+
 def main():
     mode = sys.argv[1] if len(sys.argv)>1 else "scan"
     if   mode=="serve":   serve()
     elif mode=="history": print_history()
+    elif mode=="web":     web()
     else:                 run_scan(force_confirm=False)
 
 if __name__ == "__main__":
